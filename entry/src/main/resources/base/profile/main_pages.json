@@ -1,0 +1,11 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/PageSecond",
+    "pages/PageDetail",
+    "pages/PageSettings",
+    "pages/PageTaskDetail",
+    "pages/PageNoteDetail",
+    "pages/PageProfile"
+  ]
+}
