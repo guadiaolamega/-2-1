@@ -1,0 +1,26 @@
+<<<<<<< HEAD
+.vscode/
+dist/
+lib/
+node_modules/
+package-lock.json
+*.log
+*.log.*
+*.tgz
+out/
+out[0-9]*/
+haps/
+=======
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+>>>>>>> 8b19246d4a5472c3e997fae53179cd3797d018ec

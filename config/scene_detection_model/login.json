@@ -1,0 +1,27 @@
+{
+    "events": [
+        {
+            "component": {
+                "bounds": [{"x": 42, "y": 1165}, {"x": 1302, "y": 1333}],
+                "type": "TextInput"
+            },
+            "type": "InputTextEvent",
+            "text": "admin"
+        }, 
+        {
+            "component": {
+                "bounds": [{"x": 42, "y": 1349}, {"x": 1302, "y": 1517}],
+                "type": "TextInput"
+            },
+            "type": "InputTextEvent",
+            "text": "123456"
+        },
+        {
+            "component": {
+                "bounds": [{"x": 42, "y": 1854}, {"x": 1302, "y": 1994}],
+                "type": "Button"
+            },
+            "type": "TouchEvent"
+        }
+    ]   
+}

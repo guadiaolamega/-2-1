@@ -1,0 +1,597 @@
+/*
+ * Copyright (c) 2024 Huawei Device Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import fs from 'fs';
+import { Event } from '../event/event';
+import { KeyCode } from '../model/key_code';
+import { Hap, HapRunningState } from '../model/hap';
+import { BACKGROUND_PAGE, Page, STOP_PAGE } from '../model/page';
+import { Component } from '../model/component';
+import { ViewTree } from '../model/viewtree';
+import { Point } from '../model/point';
+import { Hdc } from './hdc';
+import path from 'path';
+import { EventSimulator } from './event_simulator';
+import { HapBuilder } from '../model/builder/hap_builder';
+import { Coverage } from './coverage';
+import { FuzzOptions } from '../runner/fuzz_options';
+import { execSync } from 'child_process';
+import { HapProject } from 'bjc';
+import { findFiles } from '../utils/file_utils';
+import { Snapshot } from '../model/snapshot';
+import { getLogger } from 'log4js';
+import moment from 'moment';
+import { ArkUIInspector } from './arkui_inspector';
+import { TouchEvent } from '../event/ui_event';
+import { ArkUiDriver } from './uidriver/arkui_driver';
+import { buildDriverImpl, DriverContext } from './uidriver/build';
+import { Gesture } from '../event/gesture';
+import { PageBuilder } from '../model/builder/page_builder';
+const logger = getLogger();
+
+export class Device implements EventSimulator {
+    private hdc: Hdc;
+    private coverage?: Coverage;
+    private output: string;
+    private temp: string;
+    private displaySize?: Point;
+    private udid: string;
+    private options: FuzzOptions;
+    private arkuiInspector: ArkUIInspector;
+    private lastFaultlogs: Set<string>;
+    private driverCtx?: DriverContext;
+
+    constructor(options: FuzzOptions) {
+        this.options = options;
+        this.hdc = new Hdc(options.connectkey);
+        this.output = path.join(path.resolve(options.output), moment().format('YYYY-MM-DD-HH-mm-ss'));
+        this.udid = this.hdc.getDeviceUdid();
+        if (!fs.existsSync(this.output)) {
+            fs.mkdirSync(this.output, { recursive: true });
+        }
+        this.temp = path.join(this.output, 'temp');
+        fs.mkdirSync(this.temp, { recursive: true });
+        this.arkuiInspector = new ArkUIInspector(this.hdc);
+        this.lastFaultlogs = this.collectFaultLogger();
+    }
+
+    async connect(hap: Hap) {
+        await this.teardownDriver();
+        // install hap
+        this.installHap(hap);
+        if (this.options.coverage) {
+            this.coverage = new Coverage(this, hap, this.options.sourceRoot!);
+            this.coverage.startBftp();
+        }
+
+        this.driverCtx = await buildDriverImpl(this);
+        this.displaySize = await this.driverCtx.driver.getDisplaySize();
+    }
+
+    getDriver(): ArkUiDriver {
+        return this.driverCtx!.driver;
+    }
+
+    async disconnect(): Promise<void> {
+        await this.teardownDriver();
+        if (this.options.coverage && this.coverage) {
+            try {
+                this.coverage.stopBftp();
+            } catch {
+                // ignore
+            }
+        }
+        this.coverage = undefined;
+    }
+
+    /**
+     * Get output path
+     * @returns
+     */
+    getOutput(): string {
+        return this.output;
+    }
+
+    getHdc(): Hdc {
+        return this.hdc;
+    }
+
+    /**
+     * Get device udid
+     * @returns
+     */
+    getUdid(): string {
+        return this.udid;
+    }
+
+    /**
+     * Get device type, eg: [phone, tablet, wearable, car, tv, 2in1]
+     * @returns
+     */
+    getDeviceType(): string {
+        return this.hdc.getDeviceType();
+    }
+
+    /**
+     * Send event
+     * @param event
+     */
+    async sendEvent(event: Event): Promise<void> {
+        this.wakeupScreen();
+        await event.send(this);
+    }
+
+    /**
+     * Get the width of the screen
+     * @returns
+     */
+    getWidth(): number {
+        return this.displaySize!.x;
+    }
+
+    /**
+     * Get the height of the screen
+     * @returns
+     */
+    getHeight(): number {
+        return this.displaySize!.y;
+    }
+
+    /**
+     * Get all bundles install in the device
+     * @returns
+     */
+    getAllBundleNames(): string[] {
+        return this.hdc.getAllBundleNames();
+    }
+
+    /**
+     * Create Hap instance by bundle info
+     * @param bundleName
+     * @returns
+     */
+    getHapInTarget(bundleName: string): Hap | undefined {
+        return HapBuilder.buildFromBundleName(this, bundleName);
+    }
+
+    /**
+     * Get fault log in the devive
+     * @returns
+     */
+    collectFaultLogger(): Set<string> {
+        this.hdc.recvFile('/data/log/faultlog/', this.output);
+        return new Set<string>(findFiles(path.join(this.output, 'faultlog'), []));
+    }
+
+    /**
+     * Start ablity to run HAP
+     * @param bundleName
+     * @param abilityName
+     * @returns
+     */
+    startAblity(bundleName: string, abilityName: string): boolean {
+        return this.hdc.startAblity(bundleName, abilityName);
+    }
+
+    /**
+     * Force stop HAP
+     * @param bundleName
+     */
+    forceStop(bundleName: string) {
+        this.hdc.forceStop(bundleName);
+    }
+
+    /**
+     * Dump UI component view tree
+     * @returns
+     */
+    async dumpViewTree(): Promise<Page> {
+        let retryCnt = 5;
+        let attempt = 0;
+        while (retryCnt-- >= 0) {
+            attempt += 1;
+            let layout = await this.driverCtx!.driver.dumpLayout();
+            let pages = PageBuilder.buildPagesFromLayout(layout);
+            logger.debug(
+                `dumpViewTree attempt=${attempt} layoutType=${layout ? typeof layout : 'undefined'} pages=${pages.length}`
+            );
+            // if exist keyboard then close and dump again.
+            if (this.closeKeyboard(pages)) {
+                logger.info('Keyboard detected during dumpViewTree, sending hide event and retrying.');
+                // for sleep
+                this.hdc.getDeviceUdid();
+                continue;
+            }
+            pages.sort((a: Page, b: Page) => {
+                return b.getRoot().getHeight() - a.getRoot().getHeight();
+            });
+
+            if (pages.length > 0) {
+                return pages[0];
+            }
+        }
+        logger.warn('Device->dumpViewTree returned empty layout after retries. Returning fallback page.');
+        return this.createFallbackPage();
+    }
+
+    /**
+     * Detect keyboard and close it.
+     * @param pages
+     * @returns
+     */
+    private closeKeyboard(pages: Page[]): boolean {
+        for (const page of pages) {
+            if (page.getBundleName() !== 'com.huawei.hmos.inputmethod') {
+                continue;
+            }
+
+            for (const component of page.getComponents()) {
+                if (component.id === 'hideButton') {
+                    this.sendEvent(new TouchEvent(component));
+                    return true;
+                }
+            }
+
+            let components = page.getComponents().filter((value) => {
+                return value.hasUIEvent();
+            });
+
+            if (components.length > 1) {
+                this.sendEvent(new TouchEvent(components[2]));
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Dump inspector layout and snapshot
+     * @param bundleName
+     * @returns
+     */
+    async dumpInspector(bundleName: string): Promise<any> {
+        return this.arkuiInspector.dump(bundleName, this.options.connectkey);
+    }
+
+    /**
+     * Simulate a single click
+     * @param point
+     */
+    async click(point: Point): Promise<void> {
+        await this.driverCtx?.driver?.click(point.x, point.y);
+    }
+
+    /**
+     * Simulate a double-click operation
+     * @param point
+     */
+    async doubleClick(point: Point): Promise<void> {
+        await this.driverCtx?.driver?.doubleClick(point.x, point.y);
+    }
+
+    /**
+     * Simulate a long press
+     * @param point
+     */
+    async longClick(point: Point): Promise<void> {
+        await this.driverCtx?.driver?.longClick(point.x, point.y);
+    }
+
+    /**
+     * Simulate the input text operation in the input box
+     * @param point
+     * @param text
+     */
+    async inputText(point: Point, text: string): Promise<void> {
+        await this.driverCtx?.driver?.inputText(point, text);
+    }
+
+    /**
+     * Simulate a fast-swipe operation
+     * @param from
+     * @param to
+     * @param speed value range [200-40000]
+     * @param step swipe step size
+     */
+    async fling(from: Point, to: Point, step: number = 50, speed: number = 600): Promise<void> {
+        await this.driverCtx?.driver?.fling(from, to, step, speed);
+    }
+
+    /**
+     * Simulate a slow swipe operation
+     * @param from
+     * @param to
+     * @param speed value range [200-40000]
+     */
+    async swipe(from: Point, to: Point, speed: number = 600) {
+        await this.driverCtx?.driver?.swipe(from.x, from.y, to.x, to.y, speed);
+    }
+
+    /**
+     * Simulate drag-and-drop operation
+     * @param from
+     * @param to
+     * @param speed value range [200-40000]
+     */
+    async drag(from: Point, to: Point, speed: number = 600) {
+        await this.driverCtx?.driver?.drag(from.x, from.y, to.x, to.y, speed);
+    }
+
+    /**
+     * Simulate key input operation
+     * @param key0
+     * @param key1
+     * @param key2
+     */
+    async inputKey(key0: KeyCode, key1?: KeyCode, key2?: KeyCode) {
+        if (!key1) {
+            await this.driverCtx?.driver?.triggerKey(key0);
+        } else {
+            await this.driverCtx?.driver?.triggerCombineKeys(key0, key1, key2);
+        }
+    }
+
+    async injectGesture(gestures: Gesture[], speed: number) {
+        await this.driverCtx?.driver?.injectGesture(gestures, speed);
+    }
+
+    /**
+     * Take a screenshot
+     * @returns screenshot file path
+     */
+    capScreen(): string {
+        let retryCnt = 5;
+        while (retryCnt-- >= 0) {
+            try {
+                return this.hdc.capScreen(this.temp);
+            } catch (error) {}
+        }
+        return '';
+    }
+
+    /**
+     * wakeup screen
+     */
+    wakeupScreen(): void {
+        this.hdc.wakeupScreen();
+    }
+
+    /**
+     * get crrent Page
+     * @param hap
+     * @returns
+     */
+    async getCurrentPage(hap: Hap): Promise<Page> {
+        let page = await this.dumpViewTree();
+        const pageBundleName = page.getBundleName();
+        if (!hap.bundleName) {
+            hap.bundleName = pageBundleName;
+        }
+        if (this.options.sourceRoot) {
+            let inspector = await this.dumpInspector(hap.bundleName);
+            page.mergeInspector(inspector.layout);
+        }
+
+        // set hap running state
+        if (pageBundleName === hap.bundleName) {
+            let snapshot = this.getSnapshot(true);
+            page.setSnapshot(snapshot);
+            return page;
+        }
+
+        let runningState = this.getHapRunningState(hap);
+        let snapshot = this.getSnapshot(false);
+        if (runningState === HapRunningState.STOP) {
+            page = STOP_PAGE;
+            page.setSnapshot(snapshot);
+        } else if (runningState === HapRunningState.BACKGROUND) {
+            page = BACKGROUND_PAGE;
+            page.setSnapshot(snapshot);
+        }
+
+        return page;
+    }
+
+    /**
+     * Get current device state
+     * @returns
+     */
+    getSnapshot(onForeground: boolean): Snapshot {
+        let screen = this.capScreen();
+        let faultlogs = this.collectFaultLogger();
+        let diffLogs = new Set<string>();
+        for (const log of faultlogs) {
+            if (!this.lastFaultlogs.has(log)) {
+                diffLogs.add(log);
+            }
+        }
+        this.lastFaultlogs = faultlogs;
+
+        return new Snapshot(
+            this,
+            screen,
+            diffLogs,
+            this.coverage ? this.coverage.getCoverageFile(onForeground) : undefined
+        );
+    }
+
+    private createFallbackPage(): Page {
+        const root = new Component();
+        root.type = 'Empty';
+        const tree = new ViewTree(root);
+        return new Page(tree, '', '', '');
+    }
+
+    private async teardownDriver(): Promise<void> {
+        if (!this.driverCtx) {
+            return;
+        }
+
+        const ctx = this.driverCtx;
+        this.driverCtx = undefined;
+        this.displaySize = undefined;
+
+        try {
+            await ctx.driver.free();
+        } catch {
+            // ignore driver cleanup errors
+        }
+
+        try {
+            await ctx.rpc.close();
+        } catch {
+            // ignore rpc cleanup errors
+        }
+
+        try {
+            await ctx.agent.stop();
+        } catch {
+            // ignore agent cleanup errors
+        }
+    }
+
+    /**
+     * Install hap to device
+     * @param hap hap file
+     */
+    installHap(hap: Hap) {
+        if (hap.hapFile) {
+            this.hdc.installHap(hap.hapFile);
+            // get more hap info
+            let targetHap = this.getHapInTarget(hap.bundleName);
+            if (targetHap) {
+                hap.ablities = targetHap.ablities;
+                hap.mainAbility = targetHap.mainAbility;
+                hap.entryModuleName = targetHap.entryModuleName;
+                hap.reqPermissions = targetHap.reqPermissions;
+                hap.versionCode = targetHap.versionCode;
+            }
+        }
+    }
+
+    /**
+     * Get HAP RunningState
+     * @param hap
+     * @returns
+     */
+    getHapRunningState(hap: Hap): HapRunningState {
+        let process = this.hdc.getRunningProcess();
+        if (process.has(hap.bundleName)) {
+            return process.get(hap.bundleName)!;
+        }
+        return HapRunningState.STOP;
+    }
+
+    getBundleInfo(bundleName: string): any | undefined {
+        return this.hdc.getBundleInfo(bundleName);
+    }
+
+    buildHap(sourceRoot?: string, hapFile?: string, bundleName?: string): Hap {
+        // using hvigorw to build HAP
+        if (sourceRoot) {
+            execSync(`hvigorw -p buildMode=debug -p coverage-mode=full -p debugLine=true clean assembleHap`, {
+                stdio: 'inherit',
+                cwd: this.options.sourceRoot,
+            });
+
+            let deviceType = this.getDeviceType();
+            let project = new HapProject(sourceRoot);
+            let module = project.getModule(deviceType);
+            if (!module) {
+                logger.error(`Device->buildHap Not found ${deviceType} module.`);
+                process.exit();
+            }
+            let hapFiles = findFiles(path.join(module.path, 'build'), ['.hap']);
+            hapFiles.sort();
+            if (hapFiles.length > 0) {
+                hapFile = hapFiles[0];
+            }
+        }
+
+        if (hapFile) {
+            return HapBuilder.buildFromHapFile(hapFile);
+        }
+
+        if (bundleName) {
+            return HapBuilder.buildFromBundleName(this, bundleName);
+        }
+
+        logger.error(`Not found HAP ${this.options.hap}`);
+        process.exit();
+    }
+
+    /**
+     * Excute cmd 'hdc shell aa dump -c -l' to trigger save cov file.
+     */
+    aaDumpMission() {
+        this.hdc.aaDumpMission();
+    }
+
+    dumpHap(hap: Hap): void {
+        const localPath = path.join(this.options.output, hap.bundleName);
+        const remoteBundleDir = `/data/app/el1/bundle/public/${hap.bundleName}`;
+        if (!fs.existsSync(localPath)) {
+            fs.mkdirSync(localPath, { recursive: true });
+        }
+        // 查询 bundle 目录下的文件，只拉取 .hap / .hsp 文件
+        let hasBundleFiles = false;
+        const bundleListOutput = this.hdc.excuteShellCommandSync(`ls ${remoteBundleDir} || true`);
+        for (const line of bundleListOutput.split(/\r?\n/)) {
+            const file = line.trim();
+            if (!file) {
+                continue;
+            }
+            if (file.endsWith('.hap') || file.endsWith('.hsp')) {
+                this.hdc.recvFile(`${remoteBundleDir}/${file}`, `${localPath}/${file}`);
+                hasBundleFiles = true;
+            }
+        }
+        const pid = this.hdc.pidof(hap.bundleName);
+        if (pid === 0) {
+            logger.error(`dumpHap pidof ${hap.bundleName} failed`);
+            return;
+        }
+        const fileReg = /[\S]*\.(hap|hsp)$/;
+        const { maps, rawOutput } = this.hdc.getProcMapsWithRaw(pid, fileReg);
+    
+        // 保存原始 maps 输出到本地文件
+        const mapsFilePath = path.join(localPath, 'proc_maps.txt');
+        fs.writeFileSync(mapsFilePath, rawOutput, 'utf-8');
+
+        // 如果 bundle 目录不存在或其中没有 hap/hsp 文件，则回退到根据 maps 拉取文件
+        if (!hasBundleFiles) {
+            let files = new Set(maps.map((value) => value.file));
+            for (const file of files) {
+                this.hdc.recvFile(file, localPath);
+            }
+        }
+
+        let remote = `/data/local/tmp/${hap.bundleName}_decrypt`;
+        this.hdc.mkDir(remote);
+        
+        // 使用已获取的 maps，避免重复调用 getProcMaps
+        this.hdc.memdump(pid, remote, fileReg, maps);
+        this.hdc.recvFile(remote, `${localPath}/decrypt`);
+        this.hdc.rmDir(remote);
+        if (fs.existsSync(localPath)) {
+            const targetPath = path.join(this.options.output, `${hap.bundleName}@${hap.versionName}`);
+            if (fs.existsSync(targetPath)) {
+                fs.rmSync(targetPath, { recursive: true, force: true });
+            }
+            fs.renameSync(localPath, targetPath);
+        }
+    }
+}
